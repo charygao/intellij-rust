@@ -38,7 +38,6 @@ import com.intellij.util.indexing.IndexableFileSet
 import com.intellij.util.io.createDirectories
 import com.intellij.util.io.delete
 import com.intellij.util.io.exists
-import org.apache.commons.lang.RandomStringUtils
 import org.jetbrains.annotations.TestOnly
 import org.rust.cargo.project.model.CargoProject
 import org.rust.cargo.project.model.CargoProjectsService
@@ -52,11 +51,16 @@ import org.rust.lang.core.psi.ext.*
 import org.rust.lang.core.resolve.indexes.RsMacroCallIndex
 import org.rust.openapiext.*
 import org.rust.stdext.ThreadLocalDelegate
-import org.rust.stdext.cleanDirectory
+import org.rust.stdext.randomLowercaseAlphabetic
 import org.rust.stdext.waitForWithCheckCanceled
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.concurrent.*
+import java.util.zip.DeflaterOutputStream
+import java.util.zip.InflaterInputStream
 
 interface MacroExpansionManager {
     val indexableDirectory: VirtualFile?
@@ -84,10 +88,11 @@ inline fun MacroExpansionManager.withResolvingMacro(action: () -> Boolean): Bool
 }
 
 val MACRO_LOG = Logger.getInstance("rust.macros")
-private const val RUST_EXPANDED_MACROS = "rust_expanded_macros"
+// The path is visible in indexation progress
+const val MACRO_EXPANSION_VFS_ROOT = "rust_expanded_macros"
 
-fun getBaseMacroExpansionDir(): Path =
-    Paths.get(PathManager.getSystemPath()).resolve(RUST_EXPANDED_MACROS)
+fun getBaseMacroDir(): Path =
+    Paths.get(PathManager.getSystemPath()).resolve("intellij-rust").resolve("macros")
 
 @State(name = "MacroExpansionManager", storages = [
     Storage(StoragePathMacros.WORKSPACE_FILE),
@@ -97,7 +102,8 @@ class MacroExpansionManagerImpl(
     val project: Project
 ) : MacroExpansionManager,
     ProjectComponent,
-    PersistentStateComponent<MacroExpansionManagerImpl.PersistentState> {
+    PersistentStateComponent<MacroExpansionManagerImpl.PersistentState>,
+    Disposable {
 
     data class PersistentState(var directoryName: String? = null)
 
@@ -122,9 +128,10 @@ class MacroExpansionManagerImpl(
         if (isUnitTestMode) return // initialized manually at setUnitTestExpansionModeAndDirectory
 
         innerFuture = ApplicationManager.getApplication().executeOnPooledThread(Callable {
-            val impl = MacroExpansionServiceImplInner.build(project, dirs!!)
+            val implFn = MacroExpansionServiceImplInner.build(project, dirs!!)
             runReadAction {
                 if (project.isDisposed) return@runReadAction null
+                val impl = implFn()
                 impl.projectOpened()
                 impl
             }
@@ -132,7 +139,7 @@ class MacroExpansionManagerImpl(
     }
 
     override val indexableDirectory: VirtualFile?
-        get() = dirs?.expansionsDirVi
+        get() = if (innerFuture?.isDone == true) inner?.expansionsDirVi else null
 
     override fun getExpansionFor(call: RsMacroCall): CachedValueProvider.Result<MacroExpansion?> {
         val impl = inner
@@ -166,7 +173,7 @@ class MacroExpansionManagerImpl(
     }
 
     override fun isExpansionFile(file: VirtualFile): Boolean =
-        inner?.isExpansionFile(file) == true
+        isExpansionFileImpl(file)
 
     override fun reexpand() {
         inner?.reexpand()
@@ -184,7 +191,7 @@ class MacroExpansionManagerImpl(
     override fun setUnitTestExpansionModeAndDirectory(mode: MacroExpansionScope, cacheDirectory: String): Disposable {
         check(isUnitTestMode)
         val dir = updateDirs(if (cacheDirectory.isNotEmpty()) cacheDirectory else null)
-        val impl = MacroExpansionServiceImplInner.build(project, dir)
+        val impl = MacroExpansionServiceImplInner.build(project, dir)()
         this.dirs = dir
         this.innerFuture = CompletableFuture.completedFuture(impl)
         impl.macroExpansionMode = mode
@@ -195,6 +202,10 @@ class MacroExpansionManagerImpl(
             this.dirs = null
         })
         return disposable
+    }
+
+    override fun dispose() {
+        inner?.dispose()
     }
 
     object Testmarks {
@@ -208,41 +219,115 @@ class MacroExpansionManagerImpl(
 }
 
 private fun updateDirs(projectDirName: String?): Dirs {
-    return updateDirs0(projectDirName ?: RandomStringUtils.randomAlphabetic(8))
+    return updateDirs0(projectDirName ?: randomLowercaseAlphabetic(8))
 }
 
 private fun updateDirs0(projectDirName: String): Dirs {
-    val baseProjectDir = getBaseMacroExpansionDir().resolve(projectDirName)
-        .also { it.createDirectories() }
-    val expansionsDir = baseProjectDir.resolve("expansions")
+    val baseProjectDir = getBaseMacroDir()
         .also { it.createDirectories() }
     return Dirs(
-        baseProjectDir,
-        baseProjectDir.resolve("data.dat"),
-        LocalFileSystem.getInstance().refreshAndFindFileByIoFile(expansionsDir.toFile())!!
+        baseProjectDir.resolve("$projectDirName.dat"),
+        projectDirName
     )
 }
 
 private data class Dirs(
-    val baseProjectDir: Path,
     val dataFile: Path,
-    val expansionsDirVi: VirtualFile
-)
+    val projectDirName: String
+) {
+    // Path in the MacroExpansionVFS
+    val expansionDirPath get() = "/$MACRO_EXPANSION_VFS_ROOT/$projectDirName"
+}
+
+private fun isExpansionFileImpl(file: VirtualFile): Boolean {
+    return file.fileSystem == MacroExpansionVFS.getInstance() && !file.isDirectory
+}
 
 private class MacroExpansionServiceImplInner(
     private val project: Project,
     val dirs: Dirs,
-    private val storage: ExpandedMacroStorage
+    private val storage: ExpandedMacroStorage,
+    var expansionsDirVi: VirtualFile?
 ) {
     companion object {
-        fun build(project: Project, dirs: Dirs): MacroExpansionServiceImplInner {
+        fun build(project: Project, dirs: Dirs): () -> MacroExpansionServiceImplInner {
             val dataFile = dirs.dataFile
-            val storage = ExpandedMacroStorage.load(project, dataFile) ?: run {
+            loadProjectDirs()
+            val loaded = load(dataFile)
+
+            val vfs = MacroExpansionVFS.getInstance()
+            return if (loaded != null) {
+                val (serStorage, fs) = loaded
+                vfs.setDirectory(dirs.expansionDirPath, fs)
+                val dir = vfs.findFileByPath(dirs.expansionDirPath) // Nullable!
+                fun(): MacroExpansionServiceImplInner {
+                    val storage = serStorage.deserializeInReadAction(project)
+                    return MacroExpansionServiceImplInner(project, dirs, storage, dir)
+                }
+            } else {
                 MACRO_LOG.debug("Using fresh ExpandedMacroStorage")
-                ExpandedMacroStorage(project)
+                vfs.createDirectoryIfNotExistsOrDummy(dirs.expansionDirPath)
+                val dir = vfs.findFileByPath(dirs.expansionDirPath) // Nullable!
+                val mes = MacroExpansionServiceImplInner(project, dirs, ExpandedMacroStorage(project), dir)
+                fun(): MacroExpansionServiceImplInner = mes
             }
-            return MacroExpansionServiceImplInner(project, dirs, storage)
         }
+
+        private fun load(dataFile: Path): Pair<SerializedExpandedMacroStorage, MacroExpansionVFS.FSItem.Dir>? {
+            return try {
+                DataInputStream(InflaterInputStream(Files.newInputStream(dataFile))).use { data ->
+                    val sems = SerializedExpandedMacroStorage.load(data) ?: return null
+                    val fs = MacroExpansionVFS.readFSItem(data, null) as? MacroExpansionVFS.FSItem.Dir ?: return null
+                    sems to fs
+                }
+            } catch (e: java.nio.file.NoSuchFileException) {
+                null
+            } catch (e: Exception) {
+                MACRO_LOG.warn(e)
+                null
+            }
+        }
+
+        private fun loadProjectDirs() {
+            if (!MacroExpansionVFS.getInstance().exists("/$MACRO_EXPANSION_VFS_ROOT")) {
+                val rem = MacroExpansionVFS.FSItem.Dir(null, MACRO_EXPANSION_VFS_ROOT)
+                try {
+                    val dirs = DataInputStream(InflaterInputStream(Files.newInputStream(getProjectListDataFile()))).use { data ->
+                        val count = data.readInt()
+                        (0 until count).map {
+                            val name = data.readUTF()
+                            val ts = data.readLong()
+                            MacroExpansionVFS.FSItem.Dir.DummyDir(rem, name, ts)
+                        }
+                    }
+
+                    for (dir in dirs) {
+                        rem.addChild(dir)
+                    }
+                } catch (ignored: java.nio.file.NoSuchFileException) {
+                } catch (e: Exception) {
+                    MACRO_LOG.warn(e)
+                }
+                MacroExpansionVFS.getInstance().setDirectory("/$MACRO_EXPANSION_VFS_ROOT", rem, override = false)
+            }
+        }
+
+        private fun saveProjectDirs() {
+            val rem = MacroExpansionVFS.getInstance().getDirectory("/$MACRO_EXPANSION_VFS_ROOT")
+                as? MacroExpansionVFS.FSItem.Dir ?: return
+            val dataFile = getProjectListDataFile()
+            Files.createDirectories(dataFile.parent)
+            DataOutputStream(DeflaterOutputStream(Files.newOutputStream(dataFile))).use { data ->
+                val children = rem.copyChildren()
+                data.writeInt(children.size)
+                for (dir in children) {
+                    data.writeUTF(dir.name)
+                    data.writeLong(dir.timestamp)
+                }
+            }
+        }
+
+        private fun getProjectListDataFile() = getBaseMacroDir().resolve("project_list.dat")
     }
 
     private val taskQueue = MacroExpansionTaskQueue(project)
@@ -268,21 +353,40 @@ private class MacroExpansionServiceImplInner(
     var isResolvingMacro: Boolean by ThreadLocalDelegate { false }
 
     fun isExpansionFile(file: VirtualFile): Boolean =
-        VfsUtil.isAncestor(dirs.expansionsDirVi, file, true)
+        isExpansionFileImpl(file)
 
     fun save(): String {
-        ExpandedMacroStorage.saveStorage(storage, dataFile) // TODO async
-        return dirs.baseProjectDir.fileName.toString()
+        // TODO async
+        Files.createDirectories(dataFile.parent)
+        DataOutputStream(DeflaterOutputStream(Files.newOutputStream(dataFile))).use { data ->
+            ExpandedMacroStorage.saveStorage(storage, data)
+            MacroExpansionVFS.writeFSItem(data, MacroExpansionVFS.getInstance().getDirectory(dirs.expansionDirPath))
+        }
+        saveProjectDirs()
+        return dirs.projectDirName
+    }
+
+    fun dispose() {
+        val path = dirs.expansionDirPath
+        MacroExpansionVFS.getInstance().refreshFiles(listOf(expansionsDirVi), true, true) {
+            MacroExpansionVFS.getInstance().makeDummy(path) // Without refresh!
+        }
     }
 
     private fun cleanMacrosDirectory() {
         taskQueue.run(object : Task.Backgroundable(project, "Cleaning outdated macros", false) {
             override fun run(indicator: ProgressIndicator) {
                 checkReadAccessNotAllowed()
-                dirs.expansionsDirVi.pathAsPath.cleanDirectory()
+                val vfs = MacroExpansionVFS.getInstance()
+                if (vfs.exists(dirs.expansionDirPath)) {
+                    vfs.cleanDirectory(dirs.expansionDirPath)
+                }
+                vfs.createDirectoryIfNotExistsOrDummy(dirs.expansionDirPath)
+                expansionsDirVi = vfs.refreshAndFindFileByPath(dirs.expansionDirPath)
+                    ?: error("expected to be non-null because we just created it!")
                 dirs.dataFile.delete()
                 WriteAction.runAndWait<Throwable> {
-                    VfsUtil.markDirtyAndRefresh(false, true, true, dirs.expansionsDirVi)
+                    VfsUtil.markDirtyAndRefresh(false, true, true, expansionsDirVi)
                     storage.clear()
                     if (!project.isDisposed) {
                         project.rustPsiManager.incRustStructureModificationCount()
@@ -303,17 +407,14 @@ private class MacroExpansionServiceImplInner(
             }
 
             private fun refreshExpansionDirectory() {
-                val latch = CountDownLatch(1)
-                LocalFileSystem.getInstance().refreshFiles(listOf(dirs.expansionsDirVi), true, true) {
-                    latch.countDown()
-                }
-                latch.await()
+                expansionsDirVi = MacroExpansionVFS.getInstance().refreshAndFindFileByPath(dirs.expansionDirPath)
+                    ?: error("Not exists")
             }
 
             private fun findAndDeleteLeakedExpansionFiles() {
                 val toDelete = mutableListOf<VirtualFile>()
                 runReadAction {
-                    VfsUtil.iterateChildrenRecursively(dirs.expansionsDirVi, null, ContentIterator {
+                    VfsUtil.iterateChildrenRecursively(expansionsDirVi!!, null, ContentIterator {
                         if (!it.isDirectory && storage.getInfoForExpandedFile(it) == null) {
                             toDelete += it
                         }
@@ -321,8 +422,10 @@ private class MacroExpansionServiceImplInner(
                     })
                 }
                 if (toDelete.isNotEmpty()) {
+                    val batch = EventBasedVfsBatch()
+                    toDelete.forEach { batch.deleteFile(it.path) }
                     WriteAction.runAndWait<Throwable> {
-                        toDelete.forEach { it.delete(null) }
+                        batch.applyToVfs()
                     }
                 }
             }
@@ -339,7 +442,10 @@ private class MacroExpansionServiceImplInner(
                 }
                 if (toRemove.isNotEmpty()) {
                     WriteAction.runAndWait<Throwable> {
-                        toRemove.forEach { storage.removeInvalidInfo(it, true) }
+                        toRemove.forEach {
+                            storage.removeInvalidInfo(it, true)
+                            it.sourceFile.markForRebind()
+                        }
                     }
                 }
             }
@@ -350,7 +456,8 @@ private class MacroExpansionServiceImplInner(
         check(!isUnitTestMode) // initialized manually at setUnitTestExpansionModeAndDirectory
         setupListeners()
 
-        if (project.cargoProjects.hasAtLeastOneValidProject) {
+        val cargoProjects = project.cargoProjects
+        if (cargoProjects.initialized && cargoProjects.hasAtLeastOneValidProject) {
             processUnprocessedMacros()
         }
     }
@@ -363,15 +470,14 @@ private class MacroExpansionServiceImplInner(
         }
 
         run {
-            // Some experimental builds stored expansion to this directory
+            // Previous plugin versions stored expansion to this directory
             // TODO remove it someday
-            val oldDirPath = Paths.get(PathManager.getTempPath()).resolve("rust_expanded_macros")
+            val oldDirPath = Paths.get(PathManager.getSystemPath()).resolve("rust_expanded_macros")
             if (oldDirPath.exists()) {
                 oldDirPath.delete()
-                ApplicationManager.getApplication().invokeLater {
-                    runWriteAction {
-                        LocalFileSystem.getInstance().refreshAndFindFileByIoFile(oldDirPath.toFile())
-                    }
+                val oldDirVFile = LocalFileSystem.getInstance().findFileByIoFile(oldDirPath.toFile())
+                if (oldDirVFile != null) {
+                    VfsUtil.markDirtyAndRefresh(true, true, true, oldDirVFile)
                 }
             }
         }
@@ -523,6 +629,10 @@ private class MacroExpansionServiceImplInner(
     val isExpansionModeNew: Boolean
         get() = expansionMode is MacroExpansionMode.New
 
+    private fun vfsBatchFactory(): MacroExpansionVfsBatch {
+        return MacroExpansionVfsBatchImpl(dirs.projectDirName)
+    }
+
     private fun processUnprocessedMacros() {
         MACRO_LOG.trace("processUnprocessedMacros")
         if (!isExpansionModeNew) return
@@ -530,7 +640,7 @@ private class MacroExpansionServiceImplInner(
             project,
             storage,
             pool,
-            dirs.expansionsDirVi.pathAsPath
+            ::vfsBatchFactory
         ) {
             override fun getMacrosToExpand(): Sequence<List<Extractable>> {
                 val mode = expansionMode
@@ -568,7 +678,7 @@ private class MacroExpansionServiceImplInner(
             project,
             storage,
             pool,
-            dirs.expansionsDirVi.pathAsPath
+            ::vfsBatchFactory
         ) {
             override fun getMacrosToExpand(): Sequence<List<Extractable>> {
                 return runReadAction { storage.makeValidationTask(workspaceOnly) }
@@ -644,8 +754,9 @@ private class MacroExpansionServiceImplInner(
         if (saveCacheOnDispose) {
             save()
         } else {
-            dirs.baseProjectDir.delete()
+            dirs.dataFile.delete()
         }
+        dispose()
     }
 }
 
