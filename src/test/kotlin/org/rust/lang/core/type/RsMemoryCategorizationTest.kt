@@ -241,9 +241,35 @@ class RsMemoryCategorizationTest : RsTestBase() {
 
     @ProjectDescriptor(WithStdlibRustProjectDescriptor::class)
     fun `test array`() = testExpr("""
-        fn f(buf: &mut [u8]) {
+        fn main() {
+            let buf = [1, 2, 3];
+            (buf[0]);
+                 //^ Index, Immutable
+        }
+    """)
+
+    @ProjectDescriptor(WithStdlibRustProjectDescriptor::class)
+    fun `test array mut`() = testExpr("""
+        fn main() {
+            let mut buf = [1, 2, 3];
             (buf[0]);
                  //^ Index, Inherited
+        }
+    """)
+
+    @ProjectDescriptor(WithStdlibRustProjectDescriptor::class)
+    fun `test slice`() = testExpr("""
+        fn f(buf: &mut [u8]) {
+            (buf[0]);
+                 //^ Deref, Immutable
+        }
+    """)
+
+    @ProjectDescriptor(WithStdlibRustProjectDescriptor::class)
+    fun `test slice assign`() = testExpr("""
+        fn f(buf: &mut [u8]) {
+            buf[0] = 1;
+               //^ Deref, Declared
         }
     """)
 
